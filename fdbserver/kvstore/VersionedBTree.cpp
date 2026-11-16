@@ -49,8 +49,12 @@
 #include "flow/UnitTest.h"
 #include "fmt/format.h"
 
+#include <boost/container/flat_map.hpp>
 #include <boost/container/small_vector.hpp>
 #include <boost/intrusive/list.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
+#include <boost/unordered/unordered_node_map.hpp>
 #include <array>
 #include <cinttypes>
 #include <deque>
@@ -186,7 +190,25 @@ std::string toString(const std::map<K, V>& m) {
 }
 
 template <typename K, typename V>
-std::string toString(const std::unordered_map<K, V>& u) {
+std::string toString(const boost::container::flat_map<K, V>& m) {
+	std::string r = "{";
+	bool comma = false;
+	for (const auto& [key, value] : m) {
+		if (comma) {
+			r += ", ";
+		} else {
+			comma = true;
+		}
+		r += toString(value);
+		r += " ";
+		r += toString(key);
+	}
+	r += "}\n";
+	return r;
+}
+
+template <typename K, typename V, typename H>
+std::string toString(const boost::unordered_flat_map<K, V, H>& u) {
 	std::string r = "{";
 	bool comma = false;
 	for (const auto& n : u) {
@@ -1637,10 +1659,11 @@ Future<Void> redwoodMetricsLogger() {
 //   // Ready when object destruction is safe
 //   // Should cancel pending async operations that are safe to cancel when cache is being destroyed
 //   Future<Void> cancel() const;
-template <class IndexType, class ObjectType>
+template <class IndexType, class ObjectType, class Hash = boost::hash<IndexType>>
 class ObjectCache : NonCopyable {
 	struct Entry;
-	using CacheT = std::unordered_map<IndexType, Entry>;
+	// Entries must have stable addresses because the evictor's intrusive lists and callers hold references to them
+	using CacheT = boost::unordered_node_map<IndexType, Entry, Hash>;
 
 	struct Entry : public boost::intrusive::list_base_hook<> {
 		Entry() : hits(0), size(0) {}
@@ -1966,6 +1989,11 @@ constexpr int initialVersion = invalidVersion;
 
 class DWALPagerSnapshot;
 
+// Scatters sequential page IDs across hash buckets with a fibonacci hash multiplier.
+struct LogicalPageIDHash {
+	std::size_t operator()(LogicalPageID id) const noexcept { return static_cast<uint32_t>(id) * 2654435761u; }
+};
+
 // An implementation of IPager2 that supports atomicUpdate() of a page without forcing a change to new page ID.
 // It does this internally mapping the original page ID to alternate page IDs by write version.
 // The page id remaps are kept in memory and also logged to a "remap queue" which must be reloaded on cold start.
@@ -1978,8 +2006,10 @@ class DWALPagerSnapshot;
 class DWALPager final : public IPager2 {
 public:
 	using LogicalPageQueueT = FIFOQueue<LogicalPageID>;
-	using VersionToPageMapT = std::map<Version, LogicalPageID>;
-	using PageToVersionedMapT = std::unordered_map<LogicalPageID, VersionToPageMapT>;
+	// Flat maps are small and cache friendly and lookups are far more common than remap changes, but modifying either
+	// map invalidates iterators and references into it so callers must re-find them after any wait.
+	using VersionToPageMapT = boost::container::flat_map<Version, LogicalPageID>;
+	using PageToVersionedMapT = boost::unordered_flat_map<LogicalPageID, VersionToPageMapT, LogicalPageIDHash>;
 	struct PageCacheEntry {
 		template <bool ReadOnly>
 		using PageFuture =
@@ -2052,7 +2082,7 @@ public:
 			return Void();
 		}
 	};
-	using PageCacheT = ObjectCache<LogicalPageID, PageCacheEntry>;
+	using PageCacheT = ObjectCache<LogicalPageID, PageCacheEntry, LogicalPageIDHash>;
 
 	int64_t* getPageCachePenaltySource() override { return &pageCache.evictor().reservedSize; }
 
@@ -2161,6 +2191,14 @@ public:
 		int blocks = 1 + ((logicalPageSize - 1) / smallestPhysicalBlock);
 		physicalPageSize = blocks * smallestPhysicalBlock;
 		header.pageSize = logicalPageSize;
+	}
+
+	void preSizePageCache() {
+		int64_t const cacheLimit = pageCache.evictor().sizeLimit;
+		if (cacheLimit > 0 && physicalPageSize > 0) {
+			// 1.5x nominal capacity so write bursts or hash imbalance don't trigger a large rehash
+			pageCache.reserveCount(cacheLimit * 3 / 2 / physicalPageSize + 1);
+		}
 	}
 
 	void setExtentSize(int size) {
@@ -2450,6 +2488,9 @@ public:
 
 			self->remapCleanupFuture = Void();
 		}
+
+		// physicalPageSize is final for this recovery, so size the cache map now to avoid rehash stalls later
+		self->preSizePageCache();
 
 		if (!self->memoryOnly) {
 			fileSize = co_await self->pageFile->size();
@@ -3464,6 +3505,13 @@ public:
 			Reference<ArenaPage> data = co_await self->readPage(
 			    PagerEventReasons::MetaData, nonBtreeLevel, p.newPageID, ioLeafPriority, false, true);
 
+			// Entries can be added to remappedPages and to the version map for originalPageID during the read above.
+			// Insertion invalidates flat map iterators, so re-find both before using them below.
+			iPageMapPair = self->remappedPages.find(p.originalPageID);
+			ASSERT(iPageMapPair != self->remappedPages.end());
+			iVersionPagePair = iPageMapPair->second.find(p.version);
+			ASSERT(iVersionPagePair != iPageMapPair->second.end());
+
 			// Write the data to the original page so it can be read using its original pageID
 			self->updatePage(
 			    PagerEventReasons::MetaData, nonBtreeLevel, VectorRef<LogicalPageID>(&p.originalPageID, 1), data);
@@ -4059,7 +4107,7 @@ private:
 	ExtentUsedListQueueT extentUsedList;
 	uint64_t remapCleanupWindowBytes;
 	Reference<FlowLock> concurrentExtentReads;
-	std::unordered_set<PhysicalPageID> remapDestinationsSimOnly;
+	boost::unordered_flat_set<PhysicalPageID> remapDestinationsSimOnly;
 
 	struct SnapshotEntry {
 		Version version;
@@ -4986,7 +5034,7 @@ public:
 		Version version{ invalidVersion };
 	};
 
-	using ChildUpdateTrackerT = std::unordered_map<LogicalPageID, TrackedChildren>;
+	using ChildUpdateTrackerT = boost::unordered_flat_map<LogicalPageID, TrackedChildren, LogicalPageIDHash>;
 
 	struct BTreeCommitHeader {
 		constexpr static FileIdentifier file_identifier = 10847329;
@@ -7514,6 +7562,8 @@ private:
 		    commitState->batch.mutations->lower_bound(commitState->all.subtreeUpperBound.key);
 
 		self->expireChildUpdateTracker();
+		// Reserve for a typical commit's internal page updates to avoid a rehash stall mid-commit
+		self->childUpdateTracker.reserve(256);
 
 		co_await commitSubtree(self,
 		                       &commitState->batch,
