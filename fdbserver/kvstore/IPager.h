@@ -675,6 +675,9 @@ public:
 	// Returns true if id currently has a remap that detachRemappedPage() can detach
 	virtual bool isPageRemapped(LogicalPageID id) const = 0;
 
+	// Remap cleanup has popped every remap at a version below this, so they can no longer be detached
+	virtual Version getRemapPoppedVersion() const = 0;
+
 	// Returns the latest data (regardless of version) for a page by LogicalPageID
 	// The data returned will be the later of
 	//   - the most recent committed atomic

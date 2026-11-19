@@ -2818,6 +2818,8 @@ public:
 		}
 	}
 
+	Version getRemapPoppedVersion() const override { return remapPoppedVersion; }
+
 	bool isPageRemapped(LogicalPageID pageID) const override {
 		auto i = remappedPages.find(pageID);
 		return i != remappedPages.end() && !i->second.empty() &&
@@ -3570,6 +3572,10 @@ public:
 			int64_t remainingEntries = self->remapQueue.numEntries;
 			if (remainingEntries <= minRemapEntries ||
 			    (self->remapCleanupStop && remainingEntries <= maxRemapEntries)) {
+				if (remainingEntries == 0) {
+					CODE_PROBE(true, "DWALPager remapCleanup emptied the remap queue");
+					self->remapPoppedVersion = std::max(self->remapPoppedVersion, cutoff.version + 1);
+				}
 				debug_printf("DWALPager(%s) remapCleanup finished remainingEntries=%" PRId64 " minRemapEntries=%" PRId64
 				             " maxRemapEntries=%" PRId64,
 				             self->filename.c_str(),
@@ -3586,11 +3592,18 @@ public:
 
 			// Stop if we have reached the cutoff version, which is the start of the cleanup coalescing window
 			if (!p.present()) {
+				// Remaps are pushed in version order, so none at or below the cutoff are left
+				self->remapPoppedVersion = std::max(self->remapPoppedVersion, cutoff.version + 1);
 				debug_printf("DWALPager(%s) remapCleanup pop failed cutoffVer=%" PRId64 " items=%" PRId64 "\n",
 				             self->filename.c_str(),
 				             cutoff.version,
 				             self->remapQueue.numEntries);
 				break;
+			}
+
+			// Only remaps are pushed in version order, frees can be queued at older versions by lazy clear
+			if (p.get().getType() == RemappedPage::REMAP) {
+				self->remapPoppedVersion = std::max(self->remapPoppedVersion, p.get().version);
 			}
 
 			Future<Void> task = removeRemapEntry(self, p.get(), oldestRetainedVersion);
@@ -4037,6 +4050,8 @@ private:
 	DelayedFreePageQueueT delayedFreeList;
 
 	RemapQueueT remapQueue;
+	// Remap cleanup has popped every remap at a version below this
+	Version remapPoppedVersion = 0;
 	LogicalPageQueueT extentFreeList;
 	ExtentUsedListQueueT extentUsedList;
 	uint64_t remapCleanupWindowBytes;
