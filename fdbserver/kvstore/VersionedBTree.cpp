@@ -49,7 +49,9 @@
 #include "flow/UnitTest.h"
 #include "fmt/format.h"
 
+#include <boost/container/small_vector.hpp>
 #include <boost/intrusive/list.hpp>
+#include <array>
 #include <cinttypes>
 #include <functional>
 #include <limits>
@@ -2816,6 +2818,12 @@ public:
 		}
 	}
 
+	bool isPageRemapped(LogicalPageID pageID) const override {
+		auto i = remappedPages.find(pageID);
+		return i != remappedPages.end() && !i->second.empty() &&
+		       RemappedPage::getTypeOf(i->second.rbegin()->second) == RemappedPage::REMAP;
+	}
+
 	LogicalPageID detachRemappedPage(LogicalPageID pageID, Version v) override {
 		auto i = remappedPages.find(pageID);
 		if (i == remappedPages.end()) {
@@ -4951,33 +4959,14 @@ public:
 
 	using LazyClearQueueT = FIFOQueue<LazyClearQueueEntry>;
 
-	struct ParentInfo {
-		ParentInfo() {
-			count = 0;
-			bits = 0;
-		}
-		void clear() {
-			count = 0;
-			bits = 0;
-		}
-
-		static uint32_t mask(LogicalPageID id) { return 1 << (id & 31); }
-
-		void pageUpdated(LogicalPageID child) {
-			auto m = mask(child);
-			if ((bits & m) == 0) {
-				bits |= m;
-				++count;
-			}
-		}
-
-		bool maybeUpdated(LogicalPageID child) const { return (mask(child) & bits) != 0; }
-
-		uint32_t bits;
-		int count;
+	// Children of an internal page that were updated in place in earlier commits and may still be remapped. A parent
+	// carries at most 2, since a third detaches them, so the tracker is bounded by the number of live internal pages.
+	struct TrackedChildren {
+		std::array<LogicalPageID, 2> ids{};
+		uint8_t count{ 0 };
 	};
 
-	using ParentInfoMapT = std::unordered_map<LogicalPageID, ParentInfo>;
+	using ChildUpdateTrackerT = std::unordered_map<LogicalPageID, TrackedChildren>;
 
 	struct BTreeCommitHeader {
 		constexpr static FileIdentifier file_identifier = 10847329;
@@ -5063,6 +5052,8 @@ public:
 	void setOldestReadableVersion(Version v) { m_newOldestVersion = v; }
 
 	Version getOldestReadableVersion() const { return m_pager->getOldestReadableVersion(); }
+
+	size_t getChildUpdateTrackerSize() const { return childUpdateTracker.size(); }
 
 	Version getLastCommittedVersion() const { return m_pager->getLastCommittedVersion(); }
 
@@ -5610,7 +5601,7 @@ private:
 	std::string m_name;
 	UID m_logID;
 	int m_blockSize;
-	ParentInfoMapT childUpdateTracker;
+	ChildUpdateTrackerT childUpdateTracker;
 
 	BTreeCommitHeader m_header;
 	LazyClearQueueT m_lazyClearQueue;
@@ -6177,6 +6168,21 @@ private:
 		}
 	}
 
+	// Detached internal pages get a new ID without going through freeBTreePage(), so carry their tracked children over
+	void moveChildUpdateTracking(int parentHeight, LogicalPageID oldID, LogicalPageID newID) {
+		// Leaves have no children to track
+		if (parentHeight <= 2) {
+			return;
+		}
+		auto it = childUpdateTracker.find(oldID);
+		if (it != childUpdateTracker.end()) {
+			CODE_PROBE(true, "Redwood childUpdateTracker moved to detached internal page");
+			TrackedChildren const children = it->second;
+			childUpdateTracker.erase(it);
+			childUpdateTracker.insert_or_assign(newID, children);
+		}
+	}
+
 	// Write new version of pageID at version v using page as its data.
 	// If oldID size is 1, attempts to keep logical page ID via an atomic page update.
 	// Returns resulting BTreePageID which might be the same as the input
@@ -6391,12 +6397,8 @@ private:
 
 	struct InternalPageModifier {
 		InternalPageModifier() = default;
-		InternalPageModifier(Reference<const ArenaPage> p,
-		                     bool alreadyCloned,
-		                     bool updating,
-		                     ParentInfo* parentInfo,
-		                     int maxHeightAllowed)
-		  : updating(updating), page(p), clonedPage(alreadyCloned), changesMade(false), parentInfo(parentInfo),
+		InternalPageModifier(Reference<const ArenaPage> p, bool alreadyCloned, bool updating, int maxHeightAllowed)
+		  : updating(updating), page(p), clonedPage(alreadyCloned), changesMade(false),
 		    maxHeightAllowed(maxHeightAllowed) {}
 
 		// Whether updating the existing page is allowed
@@ -6410,7 +6412,9 @@ private:
 
 		// Whether there are any changes to the page, either made in place or staged in rebuild
 		bool changesMade;
-		ParentInfo* parentInfo;
+		// Single page children kept by this page which were updated in place, so their page IDs are unchanged but they
+		// are now remapped
+		boost::container::small_vector<LogicalPageID, 8> childrenUpdatedInPlace;
 
 		int maxHeightAllowed;
 
@@ -6532,12 +6536,13 @@ private:
 				changesMade = true;
 			} else {
 
-				// If this was an in-place update, where the child page IDs do not change, notify the
-				// parentInfo that those pages have been updated so it can possibly eliminate their
-				// second writes later.
+				// An in-place update keeps the child page IDs, so the children are now remapped and detachable, which
+				// can eliminate their second writes later.
 				if (u.inPlaceUpdate) {
-					for (auto id : u.decodeLowerBound.getChildPage()) {
-						parentInfo->pageUpdated(id);
+					BTreeNodeLinkRef const child = u.decodeLowerBound.getChildPage();
+					// Nodes larger than 1 page are never remapped.
+					if (child.size() == 1) {
+						childrenUpdatedInPlace.push_back(child.front());
 					}
 				}
 
@@ -7131,16 +7136,12 @@ private:
 			co_await waitForAll(recursions);
 			debug_printf("%s Recursions done, processing slice updates.\n", context.c_str());
 
-			// ParentInfo could be invalid after a wait and must be re-initialized.
-			// All uses below occur before waits so no reinitialization is done.
-			ParentInfo* parentInfo = &self->childUpdateTracker[rootID.front()];
-
 			// InternalPageModifier takes the results of the recursive commitSubtree() calls in order
 			// and makes changes to page as needed, copying as needed, and generating an array from
 			// which to build new page(s) if modification is not possible or not allowed.
 			// If pageCopy is already set it was initialized to page above so the modifier doesn't need
 			// to copy it
-			InternalPageModifier modifier(page, pageCopy.isValid(), tryToUpdate, parentInfo, maxHeightAllowed);
+			InternalPageModifier modifier(page, pageCopy.isValid(), tryToUpdate, maxHeightAllowed);
 
 			// Apply the possible changes for each subtree range recursed to, except the last one.
 			// For each range, the expected next record, if any, is checked against the first boundary
@@ -7165,15 +7166,74 @@ private:
 			                     modifier.changesMade || slices.back()->childrenChanged ? &update->subtreeUpperBound
 			                                                                            : &update->decodeUpperBound);
 
-			bool detachChildren = (parentInfo->count > 2);
+			// Children updated in place here and in earlier commits. This commit's were just remapped by their in-place
+			// update, but remap cleanup may have popped the earlier ones since, so those are confirmed against the
+			// pager once there are enough to detach.
+			boost::container::small_vector<LogicalPageID, 8> remappedChildren;
+			if (!modifier.childrenUpdatedInPlace.empty()) {
+				remappedChildren = std::move(modifier.childrenUpdatedInPlace);
+				if (g_network->isSimulated()) {
+					for (LogicalPageID const id : remappedChildren) {
+						ASSERT(self->m_pager->isPageRemapped(id));
+					}
+				}
+				LogicalPageID const rootPageID = rootID.front();
+				auto tracked = self->childUpdateTracker.find(rootPageID);
+				if (tracked != self->childUpdateTracker.end()) {
+					size_t const updatedHere = remappedChildren.size();
+					bool const confirm = updatedHere + tracked->second.count > 2;
+					for (int i = 0; i < tracked->second.count; ++i) {
+						LogicalPageID const id = tracked->second.ids[i];
+						if (std::find(remappedChildren.begin(), remappedChildren.begin() + updatedHere, id) !=
+						    remappedChildren.begin() + updatedHere) {
+							continue;
+						}
+						if (confirm && !self->m_pager->isPageRemapped(id)) {
+							CODE_PROBE(true, "Redwood commitSubtree tracked child remap popped before detach");
+							continue;
+						}
+						remappedChildren.push_back(id);
+					}
+				}
+
+				// More than 2 are all detached below
+				if (remappedChildren.size() > 2) {
+					if (tracked != self->childUpdateTracker.end()) {
+						self->childUpdateTracker.erase(tracked);
+					}
+				} else {
+					if (tracked == self->childUpdateTracker.end()) {
+						tracked = self->childUpdateTracker.try_emplace(rootPageID).first;
+					}
+					TrackedChildren& children = tracked->second;
+					children.count = remappedChildren.size();
+					std::copy(remappedChildren.begin(), remappedChildren.end(), children.ids.begin());
+				}
+			}
+
+			bool detachChildren = (remappedChildren.size() > 2);
+			// A commit can update most children in place, so don't search many candidates linearly for each child
+			// below. Few candidates is the common case, where binary search mispredicts more than a linear search
+			// costs.
+			bool const sortedCandidates = remappedChildren.size() > 16;
+			if (sortedCandidates) {
+				CODE_PROBE(true, "Redwood commitSubtree sorted many detach candidates");
+				std::sort(remappedChildren.begin(), remappedChildren.end());
+			}
+			auto const isDetachCandidate = [&](LogicalPageID id) {
+				return sortedCandidates
+				           ? std::binary_search(remappedChildren.begin(), remappedChildren.end(), id)
+				           : std::find(remappedChildren.begin(), remappedChildren.end(), id) != remappedChildren.end();
+			};
+			CODE_PROBE(detachChildren, "Redwood commitSubtree found remapped children to detach");
 			bool forceUpdate = false;
 
 			// If no changes were made, but we should rewrite it to point directly to remapped child pages
 			if (!modifier.changesMade && detachChildren) {
 				debug_printf(
-				    "%s Internal page forced rewrite because at least %d children have been updated in-place.\n",
+				    "%s Internal page forced rewrite because at least %zu children have been updated in-place.\n",
 				    context.c_str(),
-				    parentInfo->count);
+				    remappedChildren.size());
 
 				forceUpdate = true;
 				modifier.updating = true;
@@ -7212,18 +7272,22 @@ private:
 
 						if (detachChildren) {
 							int detached = 0;
+							// Stop walking the children once every candidate has been found
+							size_t matched = 0;
 							cursor.moveFirst();
 							auto& stats = g_redwoodMetrics.level(height);
-							while (cursor.valid()) {
+							while (cursor.valid() && matched < remappedChildren.size()) {
 								if (cursor.get().value.present()) {
 									BTreeNodeLinkRef child = cursor.get().getChildPage();
 									// Nodes larger than 1 page are never remapped.
 									if (child.size() == 1) {
 										LogicalPageID& p = child.front();
-										if (parentInfo->maybeUpdated(p)) {
+										if (isDetachCandidate(p)) {
+											++matched;
 											PhysicalPageID newID =
 											    self->m_pager->detachRemappedPage(p, batch->writeVersion);
 											if (newID != invalidPhysicalPageID) {
+												self->moveChildUpdateTracking(height, p, newID);
 												debug_printf("%s Detach updated %u -> %u\n", context.c_str(), p, newID);
 												if (self->m_pBoundaryVerifier != nullptr) {
 													self->m_pBoundaryVerifier->updatePageId(
@@ -7238,7 +7302,9 @@ private:
 								}
 								cursor.moveNext();
 							}
-							parentInfo->clear();
+							CODE_PROBE(cursor.valid(),
+							           "Redwood commitSubtree in-place detach found every candidate early");
+							CODE_PROBE(detached > 0, "Redwood commitSubtree detached children during in-place update");
 							if (forceUpdate && detached == 0) {
 								debug_printf("%s No children detached during forced update, returning slice:\n",
 								             context.c_str());
@@ -7274,18 +7340,27 @@ private:
 						             context.c_str());
 
 						if (detachChildren) {
+							// Stop walking the children once every candidate has been found
+							size_t matched = 0;
 							auto& stats = g_redwoodMetrics.level(height);
 							for (auto& rec : modifier.rebuild) {
+								if (matched == remappedChildren.size()) {
+									CODE_PROBE(true,
+									           "Redwood commitSubtree rebuild detach found every candidate early");
+									break;
+								}
 								if (rec.value.present()) {
 									BTreeNodeLinkRef oldPages = rec.getChildPage();
 
 									// Nodes larger than 1 page are never remapped.
 									if (oldPages.size() == 1) {
 										LogicalPageID p = oldPages.front();
-										if (parentInfo->maybeUpdated(p)) {
+										if (isDetachCandidate(p)) {
+											++matched;
 											PhysicalPageID newID =
 											    self->m_pager->detachRemappedPage(p, batch->writeVersion);
 											if (newID != invalidPhysicalPageID) {
+												self->moveChildUpdateTracking(height, p, newID);
 												// Records in the rebuild vector reference original page memory so make
 												// a new child link in the rebuild arena
 												BTreeNodeLinkRef newPages = BTreeNodeLinkRef(
@@ -7302,7 +7377,6 @@ private:
 									}
 								}
 							}
-							parentInfo->clear();
 						}
 						Standalone<VectorRef<RedwoodRecordRef>> newChildEntries =
 						    co_await writePages(self,
@@ -10131,6 +10205,85 @@ TEST_CASE("/redwood/correctness/unit/readOnlyPageFuture") {
 	ASSERT_EQ(survivingRead.get()->dataAsStringRef().substr(0, expectedPageContents.size()), expectedPageContents);
 
 	return Void();
+}
+
+// Churns in-place updates across a tree of height >= 3 with a remap cleanup window of windowPages pages, so parents
+// accumulate remapped children across commits and detach them. Freed parents drop their tracked children and detached
+// ones move them, so the tracker stays within the live internal pages (~85 here) whatever the window is.
+static Future<Void> runChildUpdateTrackerTest(int64_t windowPages) {
+	constexpr int pageSize = 512; // small pages so the tree is tall
+	// The metrics logger resets the metrics every interval, which would clear the counts the test checks below
+	g_redwoodMetricsActor = Void();
+	g_redwoodMetrics.clear();
+	std::string const file = "unittest_child_update_tracker.redwood-v1";
+	deleteFile(file);
+
+	VersionedBTree* btree = new VersionedBTree(new DWALPager(pageSize,
+	                                                         SERVER_KNOBS->REDWOOD_DEFAULT_EXTENT_SIZE,
+	                                                         file,
+	                                                         FLOW_KNOBS->PAGE_CACHE_4K,
+	                                                         windowPages * pageSize,
+	                                                         SERVER_KNOBS->REDWOOD_EXTENT_CONCURRENT_READS,
+	                                                         false),
+	                                           file,
+	                                           UID(),
+	                                           {});
+	co_await btree->init();
+
+	constexpr int numKeys = 50000;
+	auto key = [](int i) { return Standalone<StringRef>(format("k%08d", i)); };
+	auto value = [](int i) { return Standalone<StringRef>(format("v%08d", i)); };
+
+	Version v = btree->getLastCommittedVersion();
+	auto commit = [&]() {
+		btree->setOldestReadableVersion(v);
+		return btree->commit(++v);
+	};
+
+	for (int i = 0; i < numKeys; ++i) {
+		btree->set(KeyValueRef(key(i), value(i)));
+		if (i % 1000 == 999) {
+			co_await commit();
+		}
+	}
+
+	g_redwoodMetrics.clear();
+	size_t maxTrackerSize = 0;
+	for (int c = 0; c < 200; ++c) {
+		for (int i = 0; i < 50; ++i) {
+			int const k = deterministicRandom()->randomInt(0, numKeys);
+			btree->set(KeyValueRef(key(k), value(deterministicRandom()->randomInt(0, numKeys))));
+		}
+		co_await commit();
+		maxTrackerSize = std::max(maxTrackerSize, btree->getChildUpdateTrackerSize());
+	}
+
+	int64_t detached = 0;
+	for (unsigned int level = 2; level <= RedwoodMetrics::btreeLevels; ++level) {
+		detached += g_redwoodMetrics.level(level).metrics.detachChild;
+	}
+	printf("childUpdateTracker windowPages=%" PRId64 " maxSize=%zu detached=%" PRId64 "\n",
+	       windowPages,
+	       maxTrackerSize,
+	       detached);
+	ASSERT_GT(maxTrackerSize, 0);
+	ASSERT_LE(maxTrackerSize, 100);
+	if (windowPages > 0) {
+		// Leaf remaps outlive enough commits for their parents to collect more than 2
+		ASSERT_GT(detached, 0);
+	}
+
+	Future<Void> closedFuture = btree->onClosed();
+	btree->dispose();
+	co_await closedFuture;
+	deleteFile(file);
+}
+
+TEST_CASE("/redwood/correctness/unit/childUpdateTrackerBoundedByInternalPages") {
+	// Zero window: every remap below the oldest version is popped. Large window: nothing is popped.
+	for (int64_t const windowPages : { 0, 16, 4000 }) {
+		co_await runChildUpdateTrackerTest(windowPages);
+	}
 }
 
 TEST_CASE("/redwood/correctness/btreeCloseWithQueuedCommits") {
