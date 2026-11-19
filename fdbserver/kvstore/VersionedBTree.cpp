@@ -53,6 +53,7 @@
 #include <boost/intrusive/list.hpp>
 #include <array>
 #include <cinttypes>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <map>
@@ -4975,10 +4976,12 @@ public:
 	using LazyClearQueueT = FIFOQueue<LazyClearQueueEntry>;
 
 	// Children of an internal page that were updated in place in earlier commits and may still be remapped. A parent
-	// carries at most 2, since a third detaches them, so the tracker is bounded by the number of live internal pages.
+	// carries at most 2, since a third detaches them.
 	struct TrackedChildren {
 		std::array<LogicalPageID, 2> ids{};
 		uint8_t count{ 0 };
+		// Commit that last set ids, which remapped at least one of them
+		Version version{ invalidVersion };
 	};
 
 	using ChildUpdateTrackerT = std::unordered_map<LogicalPageID, TrackedChildren>;
@@ -5617,6 +5620,9 @@ private:
 	UID m_logID;
 	int m_blockSize;
 	ChildUpdateTrackerT childUpdateTracker;
+	// (version, parent) for every tracker entry write, in version order. Once remap cleanup pops past an entry's
+	// version none of its children can still be remapped by it, so this bounds the tracker by the remap queue.
+	std::deque<std::pair<Version, LogicalPageID>> childUpdateExpiry;
 
 	BTreeCommitHeader m_header;
 	LazyClearQueueT m_lazyClearQueue;
@@ -6184,7 +6190,7 @@ private:
 	}
 
 	// Detached internal pages get a new ID without going through freeBTreePage(), so carry their tracked children over
-	void moveChildUpdateTracking(int parentHeight, LogicalPageID oldID, LogicalPageID newID) {
+	void moveChildUpdateTracking(int parentHeight, LogicalPageID oldID, LogicalPageID newID, Version v) {
 		// Leaves have no children to track
 		if (parentHeight <= 2) {
 			return;
@@ -6194,7 +6200,35 @@ private:
 			CODE_PROBE(true, "Redwood childUpdateTracker moved to detached internal page");
 			TrackedChildren const children = it->second;
 			childUpdateTracker.erase(it);
-			childUpdateTracker.insert_or_assign(newID, children);
+			// Restamped at v rather than its own version to keep the expiry queue in version order, so a moved entry
+			// can outlive its children's remaps by up to one remap window. The detach that moved it is in the remap
+			// queue too.
+			setTrackedChildren(newID, childUpdateTracker.insert_or_assign(newID, children).first->second, v);
+		}
+	}
+
+	void setTrackedChildren(LogicalPageID parent, TrackedChildren& children, Version v) {
+		ASSERT(childUpdateExpiry.empty() || childUpdateExpiry.back().first <= v);
+		children.version = v;
+		childUpdateExpiry.emplace_back(v, parent);
+	}
+
+	// Drops tracker entries whose children's remaps have all been popped by remap cleanup
+	void expireChildUpdateTracker() {
+		Version const remapPoppedVersion = m_pager->getRemapPoppedVersion();
+		while (!childUpdateExpiry.empty() && childUpdateExpiry.front().first < remapPoppedVersion) {
+			auto const [version, parent] = childUpdateExpiry.front();
+			childUpdateExpiry.pop_front();
+			auto it = childUpdateTracker.find(parent);
+			// The entry may have been rewritten by a later commit, or freed or detached, since this was queued
+			if (it == childUpdateTracker.end()) {
+				CODE_PROBE(true, "Redwood childUpdateTracker expiry found parent already erased");
+			} else if (it->second.version != version) {
+				CODE_PROBE(true, "Redwood childUpdateTracker expiry found parent rewritten since");
+			} else {
+				CODE_PROBE(true, "Redwood childUpdateTracker expired parent");
+				childUpdateTracker.erase(it);
+			}
 		}
 	}
 
@@ -7223,6 +7257,7 @@ private:
 					TrackedChildren& children = tracked->second;
 					children.count = remappedChildren.size();
 					std::copy(remappedChildren.begin(), remappedChildren.end(), children.ids.begin());
+					self->setTrackedChildren(rootPageID, children, batch->writeVersion);
 				}
 			}
 
@@ -7302,7 +7337,7 @@ private:
 											PhysicalPageID newID =
 											    self->m_pager->detachRemappedPage(p, batch->writeVersion);
 											if (newID != invalidPhysicalPageID) {
-												self->moveChildUpdateTracking(height, p, newID);
+												self->moveChildUpdateTracking(height, p, newID, batch->writeVersion);
 												debug_printf("%s Detach updated %u -> %u\n", context.c_str(), p, newID);
 												if (self->m_pBoundaryVerifier != nullptr) {
 													self->m_pBoundaryVerifier->updatePageId(
@@ -7375,7 +7410,7 @@ private:
 											PhysicalPageID newID =
 											    self->m_pager->detachRemappedPage(p, batch->writeVersion);
 											if (newID != invalidPhysicalPageID) {
-												self->moveChildUpdateTracking(height, p, newID);
+												self->moveChildUpdateTracking(height, p, newID, batch->writeVersion);
 												// Records in the rebuild vector reference original page memory so make
 												// a new child link in the rebuild arena
 												BTreeNodeLinkRef newPages = BTreeNodeLinkRef(
@@ -7475,6 +7510,8 @@ private:
 		--mBegin;
 		MutationBuffer::const_iterator mEnd =
 		    commitState->batch.mutations->lower_bound(commitState->all.subtreeUpperBound.key);
+
+		self->expireChildUpdateTracker();
 
 		co_await commitSubtree(self,
 		                       &commitState->batch,
