@@ -1345,6 +1345,12 @@ public:
 	double REDWOOD_METRICS_INTERVAL;
 	double REDWOOD_HISTOGRAM_INTERVAL;
 	bool REDWOOD_EVICT_UPDATED_PAGES; // Whether to prioritize eviction of updated pages from cache.
+	// Whether the page cache evicts with CLOCK (second chance) instead of LRU. Read when a pager is constructed, and
+	// the process-wide evictor takes the value of the last one.
+	bool REDWOOD_PAGE_CACHE_CLOCK;
+	// The most second chances one page cache trim grants under CLOCK before it evicts the front of the eviction order
+	// whatever its counter says
+	int REDWOOD_PAGE_CACHE_CLOCK_MAX_SECOND_CHANCES;
 	int REDWOOD_DECODECACHE_REUSE_MIN_HEIGHT; // Minimum height for which to keep and reuse page decode caches
 	int REDWOOD_NODE_MAX_UNBALANCE; // Maximum imbalance in a node before it should be rebuilt instead of updated
 

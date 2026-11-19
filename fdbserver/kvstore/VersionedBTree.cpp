@@ -1640,12 +1640,14 @@ class ObjectCache : NonCopyable {
 	using CacheT = std::unordered_map<IndexType, Entry>;
 
 	struct Entry : public boost::intrusive::list_base_hook<> {
-		Entry() : hits(0), size(0) {}
+		Entry() : hits(0), size(0), freq(0) {}
 		IndexType index;
 		ObjectType item;
 		int hits;
 		int size;
 		bool ownedByEvictor;
+		// Clock only: hits since the front of the eviction order last passed this entry, capped at maxFreq.
+		uint8_t freq;
 		CacheT* pCache;
 	};
 
@@ -1656,9 +1658,38 @@ public:
 	// Not all objects tracked by the Evictor are in its evictionOrder, as ObjectCaches
 	// using this Evictor can temporarily remove entries to an external order but they
 	// must eventually give them back with moveIn() or remove them with reclaim().
+	// The eviction order has the next eviction candidate at the front, and the policy decides what a hit does to it.
 	class Evictor : NonCopyable {
 	public:
+		enum class Policy : uint8_t {
+			// Perfect LRU: a hit moves the entry to the back of the eviction order.
+			Lru,
+			// CLOCK, or second chance: a hit bumps a small counter in place and the entry keeps its position, which
+			// is much cheaper than relinking a list node on the hit path. When the front of the eviction order has a
+			// nonzero counter, trim() decrements it and moves the entry to the back instead of evicting it.
+			Clock,
+		};
+
+		// Capped at 3, the most a 2 bit counter can hold, which also matches the S3-FIFO paper's cap.
+		static constexpr uint8_t maxFreq = 3;
+
 		explicit Evictor(int64_t sizeLimit = 0) : sizeLimit(sizeLimit) {}
+
+		// Selects the eviction policy. Both policies share one eviction order, so this is safe with pages already
+		// cached and takes effect for later hits and evictions.
+		//
+		// maxSecondChances bounds the second chances one trim() call grants before it evicts the front of the
+		// eviction order whatever its counter says. Without it, trimming after every page was hit walks the whole
+		// order up to maxFreq times before anything can go, and each step is a pointer chase to a different page. It
+		// is a limit on the call rather than on each eviction, so a call that must evict many pages may force some
+		// earlier than Clock strictly would. Ignored under Lru.
+		void setPolicy(Policy newPolicy, uint32_t maxSecondChances) {
+			CODE_PROBE(newPolicy != policy && !evictionOrder.empty(),
+			           "Redwood page cache eviction policy changed with pages cached");
+			policy = newPolicy;
+			this->maxSecondChances = maxSecondChances;
+		}
+		Policy getPolicy() const { return policy; }
 
 		// Evictors are normally singletons, either one per real process or one per virtual process in simulation
 		static Evictor* getEvictor() {
@@ -1678,12 +1709,21 @@ public:
 			ASSERT(e.ownedByEvictor);
 			dest.splice(dest.end(), evictionOrder, EvictionOrderT::s_iterator_to(e));
 			e.ownedByEvictor = false;
+			// Only moved out to be evicted next, so it must not get a second chance when it comes back.
+			e.freq = 0;
 			++movedOutCount;
 		}
 
-		// Move an entry to the back of the eviction order if it is in the eviction order
-		void moveToBack(Entry& e) {
+		// Record a cache hit on an entry that is in the eviction order. Under Lru that moves it to the back, under
+		// Clock it bumps the entry's counter.
+		void recordHit(Entry& e) {
 			ASSERT(e.ownedByEvictor);
+			if (policy == Policy::Clock) {
+				if (e.freq < maxFreq) {
+					++e.freq;
+				}
+				return;
+			}
 			evictionOrder.splice(evictionOrder.end(), evictionOrder, EvictionOrderT::s_iterator_to(e));
 		}
 
@@ -1724,11 +1764,29 @@ public:
 			}
 		}
 
-		void trim(int additionalSpaceNeeded = 0) {
-			int attemptsLeft = FLOW_KNOBS->MAX_EVICT_ATTEMPTS;
+		// Returns the number of entries evicted
+		int trim(int additionalSpaceNeeded = 0, int attemptsLeft = FLOW_KNOBS->MAX_EVICT_ATTEMPTS) {
 			// While the cache is too big, evict the oldest entry until the oldest entry can't be evicted.
-			while (attemptsLeft-- > 0 && sizeUsed > (sizeLimit - reservedSize - additionalSpaceNeeded) &&
+			int evictedCount = 0;
+			uint32_t secondChances = 0;
+			while (attemptsLeft > 0 && sizeUsed > (sizeLimit - reservedSize - additionalSpaceNeeded) &&
 			       !evictionOrder.empty()) {
+				if (policy == Policy::Clock && evictionOrder.front().freq > 0) {
+					// Passing an entry is not an attempt to evict it, so second chances are bounded by
+					// maxSecondChances instead of using up attempts. Otherwise a run of hit pages at the front as long
+					// as the attempts could spend all of them and free nothing, leaving the cache over its limit.
+					if (secondChances < maxSecondChances) {
+						CODE_PROBE(true, "Redwood page cache clock gave a second chance");
+						--evictionOrder.front().freq;
+						evictionOrder.shift_forward(1);
+						++secondChances;
+						continue;
+					}
+					CODE_PROBE(true,
+					           "Redwood page cache clock evicted a hit page because its second chance budget ran out");
+				}
+				--attemptsLeft;
+
 				Entry& toEvict = evictionOrder.front();
 
 				debug_printf("Evictor count=%d sizeUsed=%" PRId64 " sizeLimit=%" PRId64 " sizePenalty=%" PRId64
@@ -1754,8 +1812,10 @@ public:
 					debug_printf("Evicting %s\n", ::toString(toEvict.index).c_str());
 					evictionOrder.pop_front();
 					toEvict.pCache->erase(toEvict.index);
+					++evictedCount;
 				}
 			}
+			return evictedCount;
 		}
 
 		int64_t getCountUsed() const { return evictionOrder.size() + movedOutCount; }
@@ -1789,6 +1849,8 @@ public:
 		int64_t sizeLimit;
 
 	private:
+		Policy policy = Policy::Lru;
+		uint32_t maxSecondChances = 0;
 		EvictionOrderT evictionOrder;
 		// Size of all entries in the eviction order or held in external eviction orders
 		int64_t sizeUsed = 0;
@@ -1843,9 +1905,9 @@ public:
 			// If this access is meant to be a hit
 			if (!noHit) {
 				++entry.hits;
-				// If item eviction is not prioritized, move to end of eviction order
+				// If item eviction is not prioritized, record the hit in the eviction order
 				if (entry.ownedByEvictor) {
-					pEvictor->moveToBack(entry);
+					pEvictor->recordHit(entry);
 				}
 			}
 		} else {
@@ -1856,6 +1918,7 @@ public:
 			entry.pCache = &cache;
 			entry.hits = 0;
 			entry.size = size;
+			entry.freq = 0;
 
 			pEvictor->trim(entry.size);
 			pEvictor->addNew(entry);
@@ -2134,8 +2197,14 @@ public:
 	    filename(filename), memoryOnly(memoryOnly), remapCleanupWindowBytes(remapCleanupWindowBytes),
 	    concurrentExtentReads(new FlowLock(concurrentExtentReads)) {
 
-		// This sets the page cache size for all PageCacheT instances using the same evictor
+		// This sets the page cache size and policy for all PageCacheT instances using the same evictor, so the last
+		// pager constructed wins. That only affects performance: both policies keep one eviction order, so switching
+		// never loses or reorders a cached page.
 		pageCache.evictor().sizeLimit = pageCacheBytes;
+		ASSERT_GE(SERVER_KNOBS->REDWOOD_PAGE_CACHE_CLOCK_MAX_SECOND_CHANCES, 0);
+		pageCache.evictor().setPolicy(SERVER_KNOBS->REDWOOD_PAGE_CACHE_CLOCK ? PageCacheT::Evictor::Policy::Clock
+		                                                                     : PageCacheT::Evictor::Policy::Lru,
+		                              SERVER_KNOBS->REDWOOD_PAGE_CACHE_CLOCK_MAX_SECOND_CHANCES);
 
 		g_redwoodMetrics.ioLock = ioLock.getPtr();
 		if (!g_redwoodMetricsActor.isValid()) {
@@ -9973,6 +10042,267 @@ static Future<Reference<ArenaPage>> neverCompletingPageRead(Reference<ArenaPage>
 	co_return page;
 }
 
+namespace ObjectCacheTest {
+
+struct CacheItem {
+	bool canEvict = true;
+	Promise<Void> safeToEvict;
+
+	bool evictable() const { return canEvict; }
+	Future<Void> onEvictable() const { return canEvict ? Future<Void>(Void()) : safeToEvict.getFuture(); }
+	Future<Void> cancel() const { return Void(); }
+};
+
+using Cache = ObjectCache<int, CacheItem>;
+using Evictor = Cache::Evictor;
+using Policy = Evictor::Policy;
+
+bool cached(Cache& cache, int index) {
+	// getIfExists() is the only lookup that leaves the eviction order alone
+	return cache.getIfExists(index) != nullptr;
+}
+
+// Fills a 4 page cache and hits every page maxFreq times, so each page is at the top of its counter.
+void fillAndHitAll(Cache& cache) {
+	for (int i = 1; i <= 4; ++i) {
+		cache.get(i, 10);
+	}
+	for (int hit = 0; hit < Evictor::maxFreq; ++hit) {
+		for (int i = 1; i <= 4; ++i) {
+			cache.get(i, 10);
+		}
+	}
+}
+
+} // namespace ObjectCacheTest
+
+// Hits bump a counter instead of moving the page, and each unit of counter buys one pass of the front of the order.
+TEST_CASE("/redwood/correctness/unit/pageCacheClock") {
+	using namespace ObjectCacheTest;
+
+	// A page hit twice outlives the pages inserted after it by one more round than a page hit once would.
+	{
+		Evictor evictor(30);
+		evictor.setPolicy(Policy::Clock, 128);
+		Cache cache(&evictor);
+		cache.get(1, 10);
+		cache.get(2, 10);
+		cache.get(3, 10);
+		cache.get(1, 10);
+		cache.get(1, 10);
+
+		cache.get(4, 10); // 1 passes once, then 2 goes
+		ASSERT(cached(cache, 1) && !cached(cache, 2) && cached(cache, 3) && cached(cache, 4));
+		cache.get(5, 10); // 3 goes
+		ASSERT(cached(cache, 1) && !cached(cache, 3) && cached(cache, 4) && cached(cache, 5));
+		cache.get(6, 10); // 1 passes a second time, then 4 goes
+		ASSERT(cached(cache, 1) && !cached(cache, 4) && cached(cache, 5) && cached(cache, 6));
+		cache.get(7, 10); // 5 goes
+		cache.get(8, 10); // 1 has no counter left, so it goes
+		ASSERT(!cached(cache, 1) && !cached(cache, 5));
+		ASSERT(cached(cache, 6) && cached(cache, 7) && cached(cache, 8));
+		ASSERT_EQ(evictor.getSizeUsed(), 30);
+		co_await cache.clear();
+		ASSERT(evictor.empty());
+	}
+
+	// The counter saturates at maxFreq, so a page hit many times is not kept forever.
+	{
+		Evictor evictor(20);
+		evictor.setPolicy(Policy::Clock, 128);
+		Cache cache(&evictor);
+		cache.get(1, 10);
+		cache.get(2, 10);
+		for (int i = 0; i < 10; ++i) {
+			cache.get(1, 10);
+		}
+		for (int next = 3; next <= 5; ++next) {
+			cache.get(next, 10);
+			ASSERT(cached(cache, 1));
+		}
+		cache.get(6, 10);
+		ASSERT(!cached(cache, 1));
+		co_await cache.clear();
+		ASSERT(evictor.empty());
+	}
+
+	// Probes and noHit accesses are not hits, so they earn no second chance.
+	{
+		Evictor evictor(20);
+		evictor.setPolicy(Policy::Clock, 128);
+		Cache cache(&evictor);
+		cache.get(1, 10);
+		cache.get(2, 10);
+		ASSERT(cache.getIfExists(1) != nullptr);
+		cache.get(1, 10, true);
+		cache.get(3, 10);
+		ASSERT(!cached(cache, 1) && cached(cache, 2) && cached(cache, 3));
+		co_await cache.clear();
+		ASSERT(evictor.empty());
+	}
+
+	// A page the pager asked to evict next goes first even if it was hit, because it comes back with no counter.
+	{
+		Evictor evictor(30);
+		evictor.setPolicy(Policy::Clock, 128);
+		Cache cache(&evictor);
+		cache.get(1, 10);
+		cache.get(2, 10);
+		cache.get(3, 10);
+		cache.get(2, 10);
+		cache.get(2, 10);
+		cache.prioritizeEviction(2);
+		cache.flushPrioritizedEvictions();
+		cache.get(4, 10);
+		ASSERT(!cached(cache, 2) && cached(cache, 1) && cached(cache, 3) && cached(cache, 4));
+		co_await cache.clear();
+		ASSERT(evictor.empty());
+	}
+
+	// An unevictable page with no counter rotates to the back and ends the call, as under Lru. One with a counter just
+	// passes.
+	{
+		Evictor evictor(20);
+		evictor.setPolicy(Policy::Clock, 128);
+		Cache cache(&evictor);
+		cache.get(1, 10).canEvict = false;
+		cache.get(2, 10);
+		evictor.sizeLimit = 10;
+		ASSERT_EQ(evictor.trim(0, 1), 0);
+		ASSERT_EQ(evictor.trim(0, 1), 1);
+		ASSERT(cached(cache, 1) && !cached(cache, 2));
+
+		evictor.sizeLimit = 20;
+		cache.get(3, 10); // order is now 1 (pinned), 3
+		cache.get(1, 10);
+		evictor.sizeLimit = 10;
+		ASSERT_EQ(evictor.trim(0, 1), 1);
+		ASSERT(cached(cache, 1) && !cached(cache, 3));
+		cache.get(1, 10).canEvict = true;
+		co_await cache.clear();
+		ASSERT(evictor.empty());
+	}
+
+	// Switching policy keeps every page and the accounting.
+	{
+		Evictor evictor(30);
+		Cache cache(&evictor);
+		cache.get(1, 10);
+		cache.get(2, 10);
+		cache.get(3, 10);
+		cache.get(1, 10); // Lru moves 1 to the back
+		evictor.setPolicy(Policy::Clock, 128);
+		ASSERT(evictor.getPolicy() == Policy::Clock);
+		ASSERT_EQ(evictor.getSizeUsed(), 30);
+		ASSERT_EQ(evictor.getCountUsed(), 3);
+		cache.get(2, 10); // Clock only counts it
+		evictor.setPolicy(Policy::Lru, 0);
+		ASSERT(evictor.getPolicy() == Policy::Lru);
+		cache.get(4, 10); // order was 2, 3, 1, so 2 goes
+		ASSERT(!cached(cache, 2) && cached(cache, 1) && cached(cache, 3) && cached(cache, 4));
+		ASSERT_EQ(evictor.getSizeUsed(), 30);
+		co_await cache.clear();
+		ASSERT(evictor.empty());
+	}
+}
+
+// With every page at the top of its counter, maxSecondChances decides how much of the order one trim() call walks.
+TEST_CASE("/redwood/correctness/unit/pageCacheClockMaxSecondChances") {
+	using namespace ObjectCacheTest;
+
+	// Unbounded, the front passes every page maxFreq times and then comes back round to the first.
+	{
+		Evictor evictor(40);
+		evictor.setPolicy(Policy::Clock, std::numeric_limits<uint32_t>::max());
+		Cache cache(&evictor);
+		fillAndHitAll(cache);
+		cache.get(5, 10);
+		ASSERT(!cached(cache, 1) && cached(cache, 2) && cached(cache, 3) && cached(cache, 4) && cached(cache, 5));
+		co_await cache.clear();
+		ASSERT(evictor.empty());
+	}
+
+	// After two second chances the front is evicted whatever its counter says, and the next call starts over.
+	{
+		Evictor evictor(40);
+		evictor.setPolicy(Policy::Clock, 2);
+		Cache cache(&evictor);
+		fillAndHitAll(cache);
+		cache.get(5, 10);
+		ASSERT(cached(cache, 1) && cached(cache, 2) && !cached(cache, 3) && cached(cache, 4) && cached(cache, 5));
+		cache.get(6, 10);
+		ASSERT(cached(cache, 1) && !cached(cache, 2) && cached(cache, 4) && cached(cache, 5) && cached(cache, 6));
+		co_await cache.clear();
+		ASSERT(evictor.empty());
+	}
+
+	// With no second chances at all it is FIFO.
+	{
+		Evictor evictor(40);
+		evictor.setPolicy(Policy::Clock, 0);
+		Cache cache(&evictor);
+		fillAndHitAll(cache);
+		cache.get(5, 10);
+		ASSERT(!cached(cache, 1) && cached(cache, 2) && cached(cache, 3) && cached(cache, 4) && cached(cache, 5));
+		co_await cache.clear();
+		ASSERT(evictor.empty());
+	}
+
+	// Second chances do not use up attempts, so one attempt is enough to evict after any number of them.
+	{
+		Evictor evictor(40);
+		evictor.setPolicy(Policy::Clock, std::numeric_limits<uint32_t>::max());
+		Cache cache(&evictor);
+		fillAndHitAll(cache);
+		evictor.sizeLimit = 30;
+		ASSERT_EQ(evictor.trim(0, 1), 1);
+		ASSERT(!cached(cache, 1) && cached(cache, 2) && cached(cache, 3) && cached(cache, 4));
+		co_await cache.clear();
+		ASSERT(evictor.empty());
+	}
+
+	// The bound is per call, not per eviction, so a call that must evict several pages forces the later ones.
+	{
+		Evictor evictor(40);
+		evictor.setPolicy(Policy::Clock, 2);
+		Cache cache(&evictor);
+		fillAndHitAll(cache);
+		evictor.sizeLimit = 10;
+		ASSERT_EQ(evictor.trim(0, 10), 3);
+		ASSERT(cached(cache, 2) && !cached(cache, 1) && !cached(cache, 3) && !cached(cache, 4));
+		ASSERT_EQ(evictor.getSizeUsed(), 10);
+		co_await cache.clear();
+		ASSERT(evictor.empty());
+	}
+}
+
+// The policy is read from the knob wherever a pager is constructed, so a store opened directly (as in a tester or
+// kvstore benchmark, without a storage server) uses it too.
+TEST_CASE("/redwood/correctness/unit/pageCacheClockKnob") {
+	auto* knobs = const_cast<ServerKnobs*>(SERVER_KNOBS);
+	bool const savedClock = knobs->REDWOOD_PAGE_CACHE_CLOCK;
+	auto* evictor = DWALPager::PageCacheT::Evictor::getEvictor();
+	std::string const file = "unittest_page_cache_clock_knob.redwood-v1";
+
+	for (bool const clock : { true, false, true }) {
+		knobs->REDWOOD_PAGE_CACHE_CLOCK = clock;
+		deleteFile(file);
+		IKeyValueStore* kvStore = keyValueStoreRedwoodV1(file, UID(), {}, FLOW_KNOBS->PAGE_CACHE_4K);
+		co_await kvStore->init();
+		ASSERT(evictor->getPolicy() ==
+		       (clock ? DWALPager::PageCacheT::Evictor::Policy::Clock : DWALPager::PageCacheT::Evictor::Policy::Lru));
+		kvStore->set(KeyValueRef("key"_sr, "value"_sr));
+		co_await kvStore->commit();
+		Optional<Value> const v = co_await kvStore->readValue("key"_sr);
+		ASSERT(v.present() && v.get() == "value"_sr);
+		Future<Void> closed = kvStore->onClosed();
+		kvStore->dispose();
+		co_await closed;
+	}
+
+	knobs->REDWOOD_PAGE_CACHE_CLOCK = savedClock;
+}
+
 TEST_CASE("/redwood/correctness/unit/pageCacheResize") {
 	constexpr int blockSize = 4096;
 	for (bool prioritized : { false, true }) {
@@ -10440,9 +10770,22 @@ TEST_CASE("Lredwood/correctness/btree") {
 	printf("Deleting existing test data...\n");
 	deleteFile(file);
 
+	// Run under either page cache policy so the clock sees the pager's real access patterns, not only the ones the knob
+	// happens to select in simulation. Pagers set the process-wide policy from the knob, so reapply it after each one.
+	bool const clockPageCache = deterministicRandom()->coinflip();
+	int const clockMaxSecondChances = deterministicRandom()->randomInt(0, 200);
+	auto const applyPageCachePolicy = [=]() {
+		DWALPager::PageCacheT::Evictor::getEvictor()->setPolicy(clockPageCache
+		                                                            ? DWALPager::PageCacheT::Evictor::Policy::Clock
+		                                                            : DWALPager::PageCacheT::Evictor::Policy::Lru,
+		                                                        clockMaxSecondChances);
+	};
+	printf("pageCachePolicy: %s\n", clockPageCache ? "clock" : "lru");
+
 	printf("Initializing...\n");
 	pager = new DWALPager(
 	    pageSize, extentSize, file, pageCacheBytes, remapCleanupWindowBytes, concurrentExtentReads, pagerMemoryOnly);
+	applyPageCachePolicy();
 
 	auto* btree = new VersionedBTree(pager, file, UID(), /*db=*/{});
 	co_await btree->init();
@@ -10680,6 +11023,7 @@ TEST_CASE("Lredwood/correctness/btree") {
 				printf("Reopening btree from disk.\n");
 				IPager2* pager = new DWALPager(
 				    pageSize, extentSize, file, pageCacheBytes, remapCleanupWindowBytes, concurrentExtentReads, false);
+				applyPageCachePolicy();
 
 				btree = new VersionedBTree(pager, file, UID(), /*db=*/{});
 
@@ -10732,6 +11076,7 @@ TEST_CASE("Lredwood/correctness/btree") {
 		                           file,
 		                           UID(),
 		                           /*db=*/{});
+		applyPageCachePolicy();
 
 		co_await btree->init();
 	}
