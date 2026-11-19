@@ -10338,6 +10338,92 @@ TEST_CASE("/redwood/correctness/unit/childUpdateTrackerBoundedByInternalPages") 
 	}
 }
 
+// Parents only need tracking while one of their tracked children's remaps is still in the remap queue. This churns a
+// few in-place updates per commit across a tree with several times more internal pages than the remap window holds
+// remaps, so parents whose child remaps were popped would pile up toward the internal page count if they weren't
+// expired. Then it drains the remap queue with vacuum(), after which no tracked child can still be detached.
+static Future<Void> runChildUpdateTrackerExpiryTest(int64_t windowPages) {
+	constexpr int pageSize = 512; // small pages so the tree has many internal pages
+	g_redwoodMetricsActor = Void();
+	g_redwoodMetrics.clear();
+	std::string const file = "unittest_child_update_tracker_expiry.redwood-v1";
+	deleteFile(file);
+
+	IPager2* pager = new DWALPager(pageSize,
+	                               SERVER_KNOBS->REDWOOD_DEFAULT_EXTENT_SIZE,
+	                               file,
+	                               FLOW_KNOBS->PAGE_CACHE_4K,
+	                               windowPages * pageSize,
+	                               SERVER_KNOBS->REDWOOD_EXTENT_CONCURRENT_READS,
+	                               false);
+	VersionedBTree* btree = new VersionedBTree(pager, file, UID(), {});
+	co_await btree->init();
+
+	constexpr int numKeys = 200000;
+	constexpr int updatesPerCommit = 10;
+	auto key = [](int i) { return Standalone<StringRef>(format("k%08d", i)); };
+	auto value = [](int i) { return Standalone<StringRef>(format("v%08d", i)); };
+
+	Version v = btree->getLastCommittedVersion();
+	auto commit = [&]() {
+		btree->setOldestReadableVersion(v);
+		return btree->commit(++v);
+	};
+
+	for (int i = 0; i < numKeys; ++i) {
+		btree->set(KeyValueRef(key(i), value(i)));
+		if (i % 1000 == 999) {
+			co_await commit();
+		}
+	}
+
+	auto const remapQueueEntries = [&]() { return pager->getStorageBytes().temp / pager->getPhysicalPageSize(); };
+	size_t maxTrackerSize = 0;
+	int64_t maxRemapQueueEntries = 0;
+	int64_t maxExcess = std::numeric_limits<int64_t>::min();
+	for (int c = 0; c < 3000; ++c) {
+		for (int i = 0; i < updatesPerCommit; ++i) {
+			int const k = deterministicRandom()->randomInt(0, numKeys);
+			btree->set(KeyValueRef(key(k), value(deterministicRandom()->randomInt(0, numKeys))));
+		}
+		co_await commit();
+		size_t const trackerSize = btree->getChildUpdateTrackerSize();
+		int64_t const queued = remapQueueEntries();
+		maxTrackerSize = std::max(maxTrackerSize, trackerSize);
+		maxRemapQueueEntries = std::max(maxRemapQueueEntries, queued);
+		maxExcess = std::max(maxExcess, static_cast<int64_t>(trackerSize) - queued);
+	}
+
+	co_await btree->vacuum();
+	size_t const drainedTrackerSize = btree->getChildUpdateTrackerSize();
+	int64_t const drainedRemapQueueEntries = remapQueueEntries();
+
+	printf("childUpdateTrackerExpiry windowPages=%" PRId64 " maxSize=%zu maxRemapQueue=%" PRId64 " maxExcess=%" PRId64
+	       " drainedSize=%zu drainedRemapQueue=%" PRId64 "\n",
+	       windowPages,
+	       maxTrackerSize,
+	       maxRemapQueueEntries,
+	       maxExcess,
+	       drainedTrackerSize,
+	       drainedRemapQueueEntries);
+	ASSERT_GT(maxTrackerSize, 0);
+	// Cleanup pops the remaps of the commit before the latest only after it is measured, so allow their parents
+	ASSERT_LE(maxExcess, 4 * updatesPerCommit);
+	ASSERT_EQ(drainedRemapQueueEntries, 0);
+	ASSERT_EQ(drainedTrackerSize, 0);
+
+	Future<Void> closedFuture = btree->onClosed();
+	btree->dispose();
+	co_await closedFuture;
+	deleteFile(file);
+}
+
+TEST_CASE("/redwood/correctness/unit/childUpdateTrackerBoundedByRemapQueue") {
+	for (int64_t const windowPages : { 0, 16, 200 }) {
+		co_await runChildUpdateTrackerExpiryTest(windowPages);
+	}
+}
+
 TEST_CASE("/redwood/correctness/btreeCloseWithQueuedCommits") {
 	g_redwoodMetricsActor = Void();
 	g_redwoodMetrics.clear();
