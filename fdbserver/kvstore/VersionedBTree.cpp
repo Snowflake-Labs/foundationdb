@@ -3604,7 +3604,9 @@ public:
 
 			// Only remaps are pushed in version order, frees can be queued at older versions by lazy clear
 			if (p.get().getType() == RemappedPage::REMAP) {
-				self->remapPoppedVersion = std::max(self->remapPoppedVersion, p.get().version);
+				// Copy the version since RemappedPage is packed and std::max would bind a misaligned reference
+				Version const poppedVersion = p.get().version;
+				self->remapPoppedVersion = std::max(self->remapPoppedVersion, poppedVersion);
 			}
 
 			Future<Void> task = removeRemapEntry(self, p.get(), oldestRetainedVersion);
